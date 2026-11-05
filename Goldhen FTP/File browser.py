@@ -2,24 +2,28 @@ import ftplib
 import ipaddress
 import os
 import sys
-import time
 import threading
+import time
 from pathlib import Path
 
-# ==========================================
+# ============================================================
 # CONFIGURATION
-# ==========================================
+# ============================================================
 
 PORT = 2121
 TIMEOUT = 15
 BLOCK_SIZE = 1024 * 1024
-PKG_DIRECTORY = "/data/pkg/"
 RETRY_DELAY = 5
 
-# Background upload state
-upload_thread = None
-upload_cancel = threading.Event()
+PKG_DIRECTORY = "/data/pkg/"
+
+# ============================================================
+# GLOBAL UPLOAD STATE
+# ============================================================
+
 upload_lock = threading.Lock()
+upload_cancel = threading.Event()
+upload_thread = None
 
 upload_status = {
     "active": False,
@@ -30,9 +34,9 @@ upload_status = {
 }
 
 
-# ==========================================
+# ============================================================
 # IP ADDRESS
-# ==========================================
+# ============================================================
 
 def ask_ip():
     while True:
@@ -41,18 +45,18 @@ def ask_ip():
         try:
             return str(ipaddress.IPv4Address(address))
         except ipaddress.AddressValueError:
-            print("Invalid IPv4 address. Try again.")
+            print("Invalid IPv4 address.")
 
 
-# ==========================================
+# ============================================================
 # FTP CONNECTION
-# ==========================================
+# ============================================================
 
-def connect(ip, timeout=TIMEOUT):
+def connect(ip):
     ftp = ftplib.FTP()
 
     try:
-        ftp.connect(ip, PORT, timeout=timeout)
+        ftp.connect(ip, PORT, timeout=TIMEOUT)
         ftp.login()
         ftp.set_pasv(True)
         return ftp
@@ -65,55 +69,88 @@ def connect(ip, timeout=TIMEOUT):
         raise
 
 
-def connect_with_retry(ip, cancel=None):
-    attempt = 0
+def close_ftp(ftp):
+    if ftp is None:
+        return
 
-    while cancel is None or not cancel.is_set():
-        attempt += 1
-
-        with upload_lock:
-            upload_status["attempts"] = attempt
-            upload_status["state"] = "Connecting"
-            upload_status["message"] = (
-                f"Connecting to {ip}:{PORT} (attempt {attempt})"
-            )
-
-        print(f"\n[UPLOAD] Connecting to {ip}:{PORT} "
-              f"(attempt {attempt})...")
-
+    try:
+        ftp.quit()
+    except (OSError, ftplib.Error):
         try:
-            ftp = connect(ip)
-            print("[UPLOAD] Connection established.")
+            ftp.close()
+        except OSError:
+            pass
+
+
+def ensure_browser_connection(ip, ftp):
+    if ftp is not None:
+        try:
+            ftp.voidcmd("NOOP")
             return ftp
+        except (OSError, EOFError, ftplib.Error):
+            close_ftp(ftp)
 
-        except (OSError, ftplib.Error) as error:
-            print(f"[UPLOAD] Connection failed: {error}")
-            print(f"[UPLOAD] Retrying in {RETRY_DELAY} seconds...")
+    print(f"\nConnecting to {ip}:{PORT}...")
 
-            with upload_lock:
-                upload_status["state"] = "Waiting"
-                upload_status["message"] = str(error)
+    try:
+        ftp = connect(ip)
+        print("Connected to GoldHEN FTP.")
+        return ftp
 
-            if cancel is not None and cancel.wait(RETRY_DELAY):
-                break
-
-            if cancel is None:
-                time.sleep(RETRY_DELAY)
-
-    return None
+    except (OSError, ftplib.Error) as error:
+        print("PS4 is currently unreachable:", error)
+        print("The browser will remain available.")
+        return None
 
 
-# ==========================================
+# ============================================================
+# UPLOAD STATUS
+# ============================================================
+
+def update_status(
+    state=None,
+    progress=None,
+    attempts=None,
+    message=None,
+    active=None
+):
+    with upload_lock:
+        if state is not None:
+            upload_status["state"] = state
+
+        if progress is not None:
+            upload_status["progress"] = progress
+
+        if attempts is not None:
+            upload_status["attempts"] = attempts
+
+        if message is not None:
+            upload_status["message"] = message
+
+        if active is not None:
+            upload_status["active"] = active
+
+
+def show_upload_status():
+    with upload_lock:
+        status = upload_status.copy()
+
+    print("\n========== UPLOAD STATUS ==========")
+    print("Active:", status["active"])
+    print("State:", status["state"])
+    print(f"Progress: {status['progress']:.2f}%")
+    print("Connection attempts:", status["attempts"])
+    print("Message:", status["message"])
+    print("===================================")
+
+
+# ============================================================
 # DIRECTORY NAVIGATION
-# ==========================================
+# ============================================================
 
 def list_directory(ftp):
     print("\nContents of:", ftp.pwd())
-
-    try:
-        ftp.retrlines("LIST")
-    except ftplib.all_errors as error:
-        print("FTP error:", error)
+    ftp.retrlines("LIST")
 
 
 def open_directory(ftp):
@@ -122,19 +159,13 @@ def open_directory(ftp):
     if not folder:
         return
 
-    try:
-        ftp.cwd(folder)
-        print("Current directory:", ftp.pwd())
-    except ftplib.all_errors as error:
-        print("Cannot open folder:", error)
+    ftp.cwd(folder)
+    print("Current directory:", ftp.pwd())
 
 
 def parent_directory(ftp):
-    try:
-        ftp.cwd("..")
-        print("Current directory:", ftp.pwd())
-    except ftplib.all_errors as error:
-        print("FTP error:", error)
+    ftp.cwd("..")
+    print("Current directory:", ftp.pwd())
 
 
 def create_directory(ftp):
@@ -149,23 +180,20 @@ def create_directory(ftp):
         print("Invalid folder name.")
         return
 
-    try:
-        ftp.mkd(folder)
-        print("Folder created:", folder)
-    except ftplib.all_errors as error:
-        print("Cannot create folder:", error)
+    ftp.mkd(folder)
+    print("Folder created:", folder)
 
 
-# ==========================================
-# DIRECTORY LISTING FOR DELETION
-# ==========================================
+# ============================================================
+# REMOTE DIRECTORY LISTING
+# ============================================================
 
-def get_directory_entries(ftp):
+def get_directory_entries(ftp, directory):
     original_directory = ftp.pwd()
     entries = []
 
     try:
-        ftp.cwd(PKG_DIRECTORY)
+        ftp.cwd(directory)
 
         lines = []
         ftp.retrlines("LIST", lines.append)
@@ -196,18 +224,14 @@ def get_directory_entries(ftp):
     )
 
 
-# ==========================================
+# ============================================================
 # NUMBERED FILE DELETION
-# ==========================================
+# ============================================================
 
 def delete_pkg_file(ftp):
     print("\n========== DELETE FROM /data/pkg/ ==========")
 
-    try:
-        entries = get_directory_entries(ftp)
-    except ftplib.all_errors as error:
-        print("Cannot read directory:", error)
-        return
+    entries = get_directory_entries(ftp, PKG_DIRECTORY)
 
     files = [
         entry for entry in entries
@@ -243,7 +267,7 @@ def delete_pkg_file(ftp):
     print("\nSelected:", filename)
 
     if input("Type DELETE to confirm: ").strip() != "DELETE":
-        print("Cancelled.")
+        print("Deletion cancelled.")
         return
 
     original_directory = ftp.pwd()
@@ -251,185 +275,404 @@ def delete_pkg_file(ftp):
     try:
         ftp.cwd(PKG_DIRECTORY)
         ftp.delete(filename)
-        print("File deleted:", filename)
-
-    except ftplib.all_errors as error:
-        print("Deletion failed:", error)
+        print("Deleted:", filename)
 
     finally:
-        try:
-            ftp.cwd(original_directory)
-        except ftplib.all_errors:
-            pass
+        ftp.cwd(original_directory)
 
 
-# ==========================================
+# ============================================================
+# REMOTE FILE SIZE
+# ============================================================
+
+def get_remote_size(ftp, filename):
+    """
+    Returns:
+        integer: remote file size
+        None: file does not exist
+        "UNSUPPORTED": SIZE is unsupported
+    """
+
+    try:
+        return ftp.size(filename)
+
+    except ftplib.error_perm as error:
+        response = str(error)
+
+        if response.startswith(("500", "501", "502", "504")):
+            return "UNSUPPORTED"
+
+        if response.startswith("550"):
+            return None
+
+        raise
+
+
+def get_size_from_listing(ftp, filename):
+    """
+    Fallback for FTP servers where SIZE is unavailable.
+    Uses the UNIX-style LIST format returned by GoldHEN.
+    """
+
+    lines = []
+    ftp.retrlines("LIST", lines.append)
+
+    for line in lines:
+        parts = line.split(maxsplit=8)
+
+        if len(parts) < 9:
+            continue
+
+        if parts[8] == filename:
+            try:
+                return int(parts[4])
+            except (ValueError, IndexError):
+                return None
+
+    return None
+
+
+def remove_remote_file_if_present(ftp, filename):
+    try:
+        ftp.delete(filename)
+    except ftplib.all_errors:
+        pass
+
+
+# ============================================================
 # BACKGROUND UPLOAD WORKER
-# ==========================================
-
-def update_upload(state=None, progress=None, message=None):
-    with upload_lock:
-        if state is not None:
-            upload_status["state"] = state
-
-        if progress is not None:
-            upload_status["progress"] = progress
-
-        if message is not None:
-            upload_status["message"] = message
-
+# ============================================================
 
 def background_upload(ip, local_path, remote_directory):
     file_path = Path(local_path)
     filename = file_path.name
 
-    # Upload to a temporary name so an interrupted transfer
-    # does not leave a partially uploaded final file.
     temporary_name = "." + filename + ".uploading"
-
     file_size = file_path.stat().st_size
 
-    while not upload_cancel.is_set():
-        ftp = None
+    rest_supported = True
+    size_supported = True
+    attempt = 0
 
-        try:
-            ftp = connect_with_retry(ip, upload_cancel)
-
-            if ftp is None:
-                break
-
-            ftp.cwd(remote_directory)
-
-            # Check how much of the temporary file already exists.
-            offset = 0
+    try:
+        while not upload_cancel.is_set():
+            ftp = None
 
             try:
-                remote_size = ftp.size(temporary_name)
+                attempt += 1
 
-                if remote_size is not None:
-                    if remote_size <= file_size:
-                        offset = remote_size
-                    else:
-                        ftp.delete(temporary_name)
+                update_status(
+                    state="Connecting",
+                    attempts=attempt,
+                    message=f"Connecting to {ip}:{PORT}"
+                )
 
-            except ftplib.all_errors:
-                # SIZE may not be supported by the FTP server.
-                # Restart the temporary upload if its size is unknown.
-                try:
-                    ftp.delete(temporary_name)
-                except ftplib.all_errors:
-                    pass
+                print(
+                    f"\n[UPLOAD] Connection attempt {attempt}..."
+                )
+
+                ftp = connect(ip)
+
+                print("[UPLOAD] Connected.")
+
+                ftp.cwd(remote_directory)
+
+                if upload_cancel.is_set():
+                    break
+
+                # --------------------------------------------
+                # DETERMINE EXISTING TEMPORARY FILE SIZE
+                # --------------------------------------------
 
                 offset = 0
 
-            if upload_cancel.is_set():
-                break
+                if size_supported:
+                    try:
+                        remote_size = get_remote_size(
+                            ftp,
+                            temporary_name
+                        )
 
-            if offset == file_size:
-                print("\n[UPLOAD] Temporary file already complete.")
+                        if remote_size == "UNSUPPORTED":
+                            size_supported = False
+                            rest_supported = False
 
-            else:
-                print(
-                    f"\n[UPLOAD] Resuming from "
-                    f"{offset:,}/{file_size:,} bytes."
-                )
+                            print(
+                                "[UPLOAD] SIZE unsupported. "
+                                "Restarting transfers from zero."
+                            )
 
-                update_upload(
-                    state="Uploading",
-                    progress=(
-                        offset / file_size * 100
-                        if file_size else 100
+                            remove_remote_file_if_present(
+                                ftp,
+                                temporary_name
+                            )
+
+                        elif remote_size is not None:
+                            if remote_size <= file_size:
+                                offset = remote_size
+                            else:
+                                print(
+                                    "[UPLOAD] Temporary file is "
+                                    "larger than the source. "
+                                    "Restarting."
+                                )
+
+                                remove_remote_file_if_present(
+                                    ftp,
+                                    temporary_name
+                                )
+
+                    except ftplib.all_errors as error:
+                        print(
+                            "[UPLOAD] Could not determine "
+                            "remote size:",
+                            error
+                        )
+
+                        size_supported = False
+                        rest_supported = False
+
+                        remove_remote_file_if_present(
+                            ftp,
+                            temporary_name
+                        )
+
+                else:
+                    remove_remote_file_if_present(
+                        ftp,
+                        temporary_name
                     )
-                )
 
-                transferred = offset
+                # --------------------------------------------
+                # UPLOAD
+                # --------------------------------------------
 
-                def progress(block):
-                    nonlocal transferred
-
-                    transferred += len(block)
-
-                    percentage = (
-                        transferred / file_size * 100
-                        if file_size else 100
-                    )
-
-                    update_upload(
-                        progress=percentage,
+                if offset != file_size:
+                    update_status(
+                        state="Uploading",
+                        progress=(
+                            offset / file_size * 100
+                            if file_size else 0
+                        ),
                         message=f"Uploading {filename}"
                     )
 
-                with file_path.open("rb") as file:
-                    file.seek(offset)
+                    transferred = offset
 
-                    ftp.storbinary(
-                        f"STOR {temporary_name}",
-                        file,
-                        blocksize=BLOCK_SIZE,
-                        callback=progress,
-                        rest=offset if offset else None
+                    def progress(block):
+                        nonlocal transferred
+
+                        if upload_cancel.is_set():
+                            raise InterruptedError(
+                                "Upload cancellation requested."
+                            )
+
+                        transferred += len(block)
+
+                        percentage = (
+                            transferred / file_size * 100
+                            if file_size else 100
+                        )
+
+                        update_status(
+                            progress=percentage
+                        )
+
+                    print(
+                        f"[UPLOAD] Starting at "
+                        f"{offset:,}/{file_size:,} bytes."
                     )
 
-            if upload_cancel.is_set():
-                break
+                    with file_path.open("rb") as file:
+                        file.seek(offset)
 
-            update_upload(
-                state="Finalizing",
-                progress=100,
-                message="Finalizing remote file"
-            )
+                        try:
+                            ftp.storbinary(
+                                f"STOR {temporary_name}",
+                                file,
+                                blocksize=BLOCK_SIZE,
+                                callback=progress,
+                                rest=(
+                                    offset
+                                    if offset and rest_supported
+                                    else None
+                                )
+                            )
 
-            # Replace the destination only after the temporary
-            # upload has completed.
-            try:
-                ftp.delete(filename)
-            except ftplib.all_errors:
-                pass
+                        except ftplib.error_perm as error:
+                            response = str(error)
 
-            ftp.rename(temporary_name, filename)
+                            # REST unsupported: restart safely
+                            # instead of retrying the same offset.
+                            if (
+                                offset
+                                and rest_supported
+                                and response.startswith(
+                                    ("500", "501", "502", "504")
+                                )
+                            ):
+                                print(
+                                    "[UPLOAD] REST unsupported. "
+                                    "Restarting from zero."
+                                )
 
-            update_upload(
-                state="Completed",
-                progress=100,
-                message=f"Completed: {filename}"
-            )
+                                rest_supported = False
 
-            print(f"\n[UPLOAD] Completed successfully: {filename}")
-            return
+                                remove_remote_file_if_present(
+                                    ftp,
+                                    temporary_name
+                                )
 
-        except (OSError, EOFError, ftplib.Error) as error:
-            print(f"\n[UPLOAD] Transfer interrupted: {error}")
-            print("[UPLOAD] Reconnecting and attempting to resume...")
+                                raise ConnectionError(
+                                    "Restart required because REST "
+                                    "is unsupported."
+                                )
 
-            update_upload(
-                state="Retrying",
-                message=str(error)
-            )
+                            raise
 
-            if upload_cancel.wait(RETRY_DELAY):
-                break
+                if upload_cancel.is_set():
+                    break
 
-        finally:
-            if ftp is not None:
-                try:
-                    ftp.quit()
-                except (OSError, ftplib.Error):
+                # --------------------------------------------
+                # VERIFY TEMPORARY FILE
+                # --------------------------------------------
+
+                update_status(
+                    state="Verifying",
+                    progress=100,
+                    message="Checking uploaded file size"
+                )
+
+                remote_size = None
+
+                if size_supported:
                     try:
-                        ftp.close()
-                    except OSError:
-                        pass
+                        remote_size = get_remote_size(
+                            ftp,
+                            temporary_name
+                        )
 
-    update_upload(
-        state="Cancelled",
-        message="Upload cancelled."
-    )
+                        if remote_size == "UNSUPPORTED":
+                            size_supported = False
 
-    print("\n[UPLOAD] Upload stopped.")
+                    except ftplib.all_errors:
+                        size_supported = False
+
+                if not size_supported or remote_size is None:
+                    remote_size = get_size_from_listing(
+                        ftp,
+                        temporary_name
+                    )
+
+                if remote_size is None:
+                    raise RuntimeError(
+                        "Unable to verify the uploaded file size."
+                    )
+
+                if remote_size != file_size:
+                    raise ConnectionError(
+                        f"Size mismatch: local={file_size}, "
+                        f"remote={remote_size}"
+                    )
+
+                print("[UPLOAD] File size verified.")
+
+                if upload_cancel.is_set():
+                    break
+
+                # --------------------------------------------
+                # FINALIZE
+                # --------------------------------------------
+
+                update_status(
+                    state="Finalizing",
+                    progress=100,
+                    message="Renaming temporary file"
+                )
+
+                # Never delete an existing destination here.
+                # If the server refuses to replace it, report
+                # the error rather than risking data loss.
+                ftp.rename(temporary_name, filename)
+
+                update_status(
+                    state="Completed",
+                    progress=100,
+                    message=f"Completed: {filename}"
+                )
+
+                print(
+                    f"\n[UPLOAD] Successfully completed: {filename}"
+                )
+
+                return
+
+            except InterruptedError:
+                print("\n[UPLOAD] Cancellation requested.")
+                break
+
+            except RuntimeError as error:
+                print("\n[UPLOAD] Cannot safely finalize:", error)
+                update_status(
+                    state="Failed",
+                    message=str(error)
+                )
+                return
+
+            except ftplib.error_perm as error:
+                print("\n[UPLOAD] FTP permission/server error:", error)
+
+                update_status(
+                    state="Failed",
+                    message=str(error)
+                )
+                return
+
+            except (
+                OSError,
+                EOFError,
+                ftplib.Error,
+                ConnectionError
+            ) as error:
+                print("\n[UPLOAD] Connection/transfer interrupted:", error)
+                print(
+                    f"[UPLOAD] Retrying in {RETRY_DELAY} seconds..."
+                )
+
+                update_status(
+                    state="Retrying",
+                    message=str(error)
+                )
+
+                if upload_cancel.wait(RETRY_DELAY):
+                    break
+
+            finally:
+                close_ftp(ftp)
+
+    finally:
+        if upload_cancel.is_set():
+            update_status(
+                state="Cancelled",
+                message="Upload cancelled."
+            )
+        elif upload_status["state"] not in (
+            "Completed",
+            "Failed"
+        ):
+            update_status(
+                state="Stopped",
+                message="Upload stopped."
+            )
+
+        update_status(active=False)
+
+        print("\n[UPLOAD] Worker stopped.")
 
 
-# ==========================================
+# ============================================================
 # START BACKGROUND UPLOAD
-# ==========================================
+# ============================================================
 
 def start_upload(ip, remote_directory, pkg_only=False):
     global upload_thread
@@ -458,19 +701,18 @@ def start_upload(ip, remote_directory, pkg_only=False):
     print("Destination:", remote_directory)
 
     if input("Start background upload? (y/n): ").strip().lower() != "y":
-        print("Cancelled.")
+        print("Upload cancelled.")
         return
 
     upload_cancel.clear()
 
-    with upload_lock:
-        upload_status.update({
-            "active": True,
-            "state": "Starting",
-            "progress": 0.0,
-            "attempts": 0,
-            "message": "Starting background upload"
-        })
+    update_status(
+        state="Starting",
+        progress=0,
+        attempts=0,
+        message="Starting background upload",
+        active=True
+    )
 
     upload_thread = threading.Thread(
         target=background_upload,
@@ -481,45 +723,26 @@ def start_upload(ip, remote_directory, pkg_only=False):
     upload_thread.start()
 
     print("\nBackground upload started.")
-    print("You can continue using the FTP browser.")
+    print("The FTP browser remains available.")
 
 
-# ==========================================
-# UPLOAD STATUS
-# ==========================================
-
-def show_upload_status():
-    with upload_lock:
-        state = upload_status["state"]
-        progress = upload_status["progress"]
-        attempts = upload_status["attempts"]
-        message = upload_status["message"]
-
-    print("\n========== UPLOAD STATUS ==========")
-    print("State:", state)
-    print(f"Progress: {progress:.2f}%")
-    print("Connection attempts:", attempts)
-    print("Message:", message)
-    print("===================================")
-
-
-# ==========================================
+# ============================================================
 # CANCEL UPLOAD
-# ==========================================
+# ============================================================
 
 def cancel_upload():
     if upload_thread is None or not upload_thread.is_alive():
         print("No active upload.")
         return
 
-    if input("Type CANCEL to stop the upload: ").strip() == "CANCEL":
+    if input("Type CANCEL to stop: ").strip() == "CANCEL":
         upload_cancel.set()
         print("Cancellation requested.")
 
 
-# ==========================================
+# ============================================================
 # MAIN MENU
-# ==========================================
+# ============================================================
 
 def show_menu():
     print("\n========== GOLDHEN FTP BROWSER ==========")
@@ -537,33 +760,55 @@ def show_menu():
     print("=========================================")
 
 
-# ==========================================
+# ============================================================
 # MAIN PROGRAM
-# ==========================================
+# ============================================================
 
 def main():
-    global upload_thread
-
     ip = ask_ip()
 
     print("\nPS4 IP:", ip)
     print("FTP port:", PORT)
 
-    ftp = connect_with_retry(ip)
+    ftp = None
 
-    if ftp is None:
-        print("Could not connect.")
-        return
+    print("\nThe browser will start even if the PS4 is offline.")
 
-    print("\nConnected successfully!")
-    print("Current directory:", ftp.pwd())
+    while True:
+        show_menu()
 
-    try:
-        while True:
-            show_menu()
+        choice = input("> ").strip()
 
-            choice = input("> ").strip()
+        # These options do not need the browser FTP connection.
+        if choice == "9":
+            show_upload_status()
+            continue
 
+        if choice == "10":
+            cancel_upload()
+            continue
+
+        if choice == "11":
+            if upload_thread is not None and upload_thread.is_alive():
+                print(
+                    "An upload is still running. "
+                    "Wait for it to finish or cancel it first."
+                )
+                continue
+
+            break
+
+        if choice not in ("1", "2", "3", "4", "5", "6", "7", "8"):
+            print("Invalid option.")
+            continue
+
+        ftp = ensure_browser_connection(ip, ftp)
+
+        if ftp is None:
+            print("Cannot perform this operation while offline.")
+            continue
+
+        try:
             if choice == "1":
                 list_directory(ftp)
 
@@ -592,35 +837,28 @@ def main():
             elif choice == "8":
                 delete_pkg_file(ftp)
 
-            elif choice == "9":
-                show_upload_status()
+        except (
+            OSError,
+            EOFError,
+            ftplib.Error
+        ) as error:
+            print("\nFTP operation failed:", error)
+            print("The browser will reconnect on its next operation.")
 
-            elif choice == "10":
-                cancel_upload()
+            close_ftp(ftp)
+            ftp = None
 
-            elif choice == "11":
-                if upload_thread is not None and upload_thread.is_alive():
-                    print("An upload is still running.")
-                    print("Cancel it before exiting.")
-                    continue
+    close_ftp(ftp)
 
-                break
-
-            else:
-                print("Invalid option.")
-
-    except KeyboardInterrupt:
-        print("\nInterrupted.")
-
-    finally:
-        try:
-            ftp.quit()
-        except ftplib.all_errors:
-            ftp.close()
-
-        print("FTP browser disconnected.")
-        input("Press Enter to close...")
+    print("\nFTP browser closed.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+
+    except KeyboardInterrupt:
+        print("\nProgram interrupted.")
+
+    finally:
+        print("Program stopped.")
