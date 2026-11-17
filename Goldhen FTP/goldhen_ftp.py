@@ -379,7 +379,7 @@ def remove_remote_file_if_present(ftp, filename):
 # BACKGROUND UPLOAD
 # ============================================================
 
-def background_upload(ip, local_path, remote_directory):
+def background_upload_single(ip, local_path, remote_directory):
     file_path = Path(local_path)
     filename = file_path.name
     temporary_name = "." + filename + ".uploading"
@@ -587,9 +587,162 @@ def background_upload(ip, local_path, remote_directory):
         print("\n[UPLOAD] Worker stopped.")
 
 
+def set_upload_power_request(enabled):
+    """Keep Windows and the display awake while uploading; restore normal behavior afterward."""
+    import ctypes
+
+    ES_CONTINUOUS = 0x80000000
+    ES_SYSTEM_REQUIRED = 0x00000001
+    ES_DISPLAY_REQUIRED = 0x00000002
+
+    flags = (
+        ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+        if enabled else ES_CONTINUOUS
+    )
+    result = ctypes.windll.kernel32.SetThreadExecutionState(flags)
+    if result == 0:
+        raise ctypes.WinError()
+
+
+def background_upload(ip, local_paths, remote_directory):
+    """Upload selected files while preventing Windows from sleeping."""
+    power_request_set = False
+    try:
+        try:
+            set_upload_power_request(True)
+            power_request_set = True
+            print("[POWER] Sleep prevention enabled for the upload.")
+        except Exception as error:
+            print("[POWER] Warning: could not prevent system sleep:", error)
+
+        total = len(local_paths)
+        failed_files = []
+
+        for index, local_path in enumerate(local_paths, start=1):
+            if upload_cancel.is_set():
+                break
+
+            file_name = Path(local_path).name
+            update_status(
+                state="Starting",
+                progress=0,
+                attempts=0,
+                message=f"Uploading file {index}/{total}: {file_name}",
+                active=True,
+            )
+            print(f"\\n[BATCH] File {index}/{total}: {file_name}")
+
+            background_upload_single(ip, local_path, remote_directory)
+
+            result = get_upload_state()
+            if result["state"] == "Failed":
+                failed_files.append(file_name)
+
+            if upload_cancel.is_set():
+                break
+
+        if upload_cancel.is_set():
+            update_status(state="Cancelled", message="Upload batch cancelled.", active=False)
+        elif failed_files:
+            failed_list = ", ".join(failed_files)
+            update_status(
+                state="Completed with errors",
+                progress=100,
+                message=f"Processed {total} file(s); failed: {failed_list}",
+                active=False,
+            )
+            print(f"\\n[BATCH] Finished with failed file(s): {failed_list}")
+        else:
+            update_status(
+                state="Completed",
+                progress=100,
+                message=f"Successfully uploaded {total} selected file(s).",
+                active=False,
+            )
+            print(f"\\n[BATCH] Successfully uploaded {total} selected file(s).")
+    finally:
+        if power_request_set:
+            try:
+                set_upload_power_request(False)
+                print("[POWER] Sleep prevention released; normal power settings restored.")
+            except Exception as error:
+                print("[POWER] Warning: could not release sleep prevention:", error)
+
+
 # ============================================================
 # START / CANCEL UPLOAD
 # ============================================================
+
+def choose_upload_files():
+    """Open the Windows Explorer-style picker with multi-select explicitly enabled."""
+    import json
+    import subprocess
+
+    powershell_script = r"""
+Add-Type -AssemblyName System.Windows.Forms
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.Title = 'Select one or more files to upload'
+$dialog.Filter = 'All files (*.*)|*.*'
+$dialog.Multiselect = $true
+$dialog.CheckFileExists = $true
+$dialog.CheckPathExists = $true
+$dialog.AutoUpgradeEnabled = $true
+$result = $dialog.ShowDialog()
+if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+    ConvertTo-Json -InputObject @($dialog.FileNames) -Compress
+}
+$dialog.Dispose()
+"""
+
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-STA",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            powershell_script,
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=None,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+    if completed.returncode != 0:
+        details = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(
+            "Windows multi-select file picker failed: "
+            + (details or f"PowerShell exited with code {completed.returncode}.")
+        )
+
+    output = completed.stdout.strip()
+    if not output:
+        return []
+
+    try:
+        selected = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            "Could not decode the selected file paths returned by Windows."
+        ) from error
+
+    # PowerShell may serialize a one-item array as a single JSON string.
+    if isinstance(selected, str):
+        selected = [selected]
+    if not isinstance(selected, list):
+        raise RuntimeError("Windows returned an unexpected file selection.")
+
+    paths = [Path(item) for item in selected if isinstance(item, str) and item]
+    if len(paths) != len(selected):
+        raise RuntimeError("Windows returned one or more invalid file paths.")
+
+    return paths
+
 
 def start_upload(ip, remote_directory, pkg_only=False):
     global upload_thread
@@ -598,21 +751,28 @@ def start_upload(ip, remote_directory, pkg_only=False):
         print("An upload is already running.")
         return
 
-    local_path = input("Full local file path: ").strip().strip('"')
-    if not local_path:
+    try:
+        file_paths = choose_upload_files()
+    except Exception as error:
+        print("Could not open the Explorer file picker:", error)
         return
 
-    file_path = Path(local_path).expanduser()
-    if not file_path.is_file():
-        print("File not found.")
+    if not file_paths:
+        print("File selection cancelled.")
         return
 
-    if pkg_only and file_path.suffix.lower() != ".pkg":
-        print("Please select a .pkg file.")
+    invalid_paths = [path for path in file_paths if not path.is_file()]
+    if invalid_paths:
+        print("These selections are not files:")
+        for path in invalid_paths:
+            print(" -", path)
         return
 
-    print("\nFile:", file_path.name)
-    print("Size:", f"{file_path.stat().st_size:,}", "bytes")
+    total_size = sum(path.stat().st_size for path in file_paths)
+    print(f"\nSelected {len(file_paths)} file(s):")
+    for path in file_paths:
+        print(f" - {path.name} ({path.stat().st_size:,} bytes)")
+    print("Total size:", f"{total_size:,}", "bytes")
     print("Destination:", remote_directory)
 
     if input("Start background upload? (y/n): ").strip().lower() != "y":
@@ -630,7 +790,7 @@ def start_upload(ip, remote_directory, pkg_only=False):
 
     upload_thread = threading.Thread(
         target=background_upload,
-        args=(ip, str(file_path), remote_directory),
+        args=(ip, [str(path) for path in file_paths], remote_directory),
         name="GoldHEN-Background-Upload",
         daemon=False,
     )
@@ -659,8 +819,11 @@ def show_menu():
     print("3. Parent directory")
     print("4. Show current directory")
     print("5. Create folder")
-    print("6. Upload file to current directory")
-    print("7. Upload PKG to /data/pkg/")
+    print("6. Select file(s) to upload to current directory")
+    print("7. Select file(s) to upload to /data/pkg/")
+    print("   For options 6 and 7: hold CTRL and click each file to select")
+    print("   multiple files. Use SHIFT+click for a range, or CTRL+A")
+    print("   to select all files. Then click Open.")
     print("8. Delete numbered file from /data/pkg/")
     print("9. Show upload status")
     print("10. Cancel background upload")
